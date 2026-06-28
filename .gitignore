@@ -1,0 +1,23 @@
+﻿# Python / virtualenv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# Local debug / generated comparison helpers
+debug_correct.py
+generate_comparisons.py
+
+# Logs and temporary files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# Agent/internal planning docs
+docs/superpowers/

@@ -1,0 +1,9 @@
+PySide6
+rawpy
+Pillow
+numpy
+opencv-python
+imageio-ffmpeg
+piexif
+pytest
+pyinstaller
