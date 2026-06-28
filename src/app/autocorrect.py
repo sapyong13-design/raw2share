@@ -128,16 +128,22 @@ def _skin_mask_rgb(image_np: np.ndarray) -> np.ndarray:
     return cv2.GaussianBlur(mask, (7, 7), 0).astype(np.float32) / 255.0
 
 
-def _safe_gray_world_white_balance(image_np: np.ndarray, strength: float) -> np.ndarray:
+def _safe_gray_world_white_balance(image_np: np.ndarray, strength: float, neutral_wall_mask: np.ndarray = None) -> np.ndarray:
     if strength <= 0:
         return image_np
     rgb = image_np.astype(np.float32)
-    hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    neutral = (saturation < 72) & (value > 35) & (value < 235)
-    if int(np.count_nonzero(neutral)) < image_np.shape[0] * image_np.shape[1] * 0.03:
-        neutral = (value > 35) & (value < 230)
+    use_guided = False
+    if neutral_wall_mask is not None:
+        neutral = neutral_wall_mask > 128
+        if int(np.count_nonzero(neutral)) > image_np.shape[0] * image_np.shape[1] * 0.005:
+            use_guided = True
+    if not use_guided:
+        hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        neutral = (saturation < 72) & (value > 35) & (value < 235)
+        if int(np.count_nonzero(neutral)) < image_np.shape[0] * image_np.shape[1] * 0.03:
+            neutral = (value > 35) & (value < 230)
     if int(np.count_nonzero(neutral)) == 0:
         return image_np
     means = rgb[neutral].mean(axis=0)
@@ -162,8 +168,10 @@ def apply_recommended_adjustments(
     image_np: np.ndarray,
     is_raw: bool = False,
     candidate_profile: str = "balanced_pop",
+    smart_strength: str = "Event Balanced",
+    masks = None,
 ) -> np.ndarray:
-    """Apply scene-aware Smart Auto adjustments from image analysis."""
+    """Apply scene-aware Smart Auto adjustments from image analysis, refined with region masks."""
     analysis = analyze_image(image_np, is_raw=is_raw)
     rec = recommend_adjustments(analysis)
     profile = {
@@ -258,33 +266,57 @@ def apply_recommended_adjustments(
             "subject_boost": 0.04,
         },
     }.get(candidate_profile, {})
+    strength_key = (smart_strength or "Event Balanced").strip().lower()
+    strength = {
+        "natural": {"exposure": 0.86, "shadow": 0.78, "contrast": 0.72, "vibrance": 0.62, "clarity": 0.65},
+        "event balanced": {"exposure": 1.0, "shadow": 1.0, "contrast": 1.0, "vibrance": 1.0, "clarity": 1.0},
+        "event bright": {"exposure": 1.12, "shadow": 1.12, "contrast": 0.95, "vibrance": 1.05, "clarity": 0.95},
+        "strong pop": {"exposure": 1.08, "shadow": 1.05, "contrast": 1.20, "vibrance": 1.28, "clarity": 1.12},
+    }.get(strength_key, {"exposure": 1.0, "shadow": 1.0, "contrast": 1.0, "vibrance": 1.0, "clarity": 1.0})
+
+    # Get region masks
+    if masks is None:
+        from app.region_detection import detect_regions
+        masks = detect_regions(image_np, is_raw=is_raw)
+
+    skin_mask_float = masks.skin.astype(np.float32) / 255.0
+    face_person_float = masks.face_person.astype(np.float32) / 255.0
+    lamp_highlight_float = masks.lamp_highlight.astype(np.float32) / 255.0
+    sky_bright_outdoor_float = masks.sky_bright_outdoor.astype(np.float32) / 255.0
+    background_float = masks.background.astype(np.float32) / 255.0
+    shadow_noise_float = masks.shadow_noise.astype(np.float32) / 255.0
+    neutral_wall_floor_float = masks.neutral_wall_floor.astype(np.float32) / 255.0
 
     # RAW needs lens/profile compensation. Camera/JPG images already include camera correction;
     # radial gain on JPG indoor shots creates colored lamp and wall artifacts.
     if is_raw and rec.correct_vignette:
         image_np = correct_raw_corner_shading(image_np, strength=0.82)
 
-    skin_mask = _skin_mask_rgb(image_np)
     is_people_indoor = analysis.has_skin and analysis.has_subject and analysis.scene in {"indoor_balanced", "low_light", "backlit_high_contrast"}
 
-    # Gentle gray-world WB from low-saturation neutrals, like a conservative Auto WB pass.
+    # Gentle gray-world WB guided by neutral wall/floor regions
     wb_strength = (0.22 if is_people_indoor else 0.12) * profile.get("wb_mult", 1.0)
-    image_np = _safe_gray_world_white_balance(image_np, wb_strength)
+    image_np = _safe_gray_world_white_balance(image_np, wb_strength, neutral_wall_mask=masks.neutral_wall_floor)
 
     lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     lf = np.clip(l.astype(np.float32) / 255.0, 0.0, 1.0)
 
-    # Subject-first exposure: center/skin receives more lift; highlights/lamp stay protected.
+    # Subject-first exposure: center/skin/faces receive more lift; highlights/lamp stay protected.
     h, w = lf.shape
     yy, xx = np.mgrid[0:h, 0:w]
     cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
     sigma_x, sigma_y = max(w * 0.34, 1.0), max(h * 0.34, 1.0)
     center_weight = np.exp(-(((xx - cx) ** 2) / (2 * sigma_x ** 2) + ((yy - cy) ** 2) / (2 * sigma_y ** 2))).astype(np.float32)
-    subject_weight = np.clip(0.55 * center_weight + 0.75 * skin_mask, 0.0, 1.0)
+    
+    # Refined subject weight focusing heavily on actual faces & skin tones when present
+    subject_weight = np.clip(0.40 * center_weight + 0.50 * skin_mask_float + 0.65 * face_person_float, 0.0, 1.0)
+    
+    # Highlight protection incorporating the dilated lamp_highlight mask to safeguard light sources from blowout
     highlight_protect = 1.0 - np.clip((lf - 0.78) / 0.22, 0.0, 1.0) ** 2
+    highlight_protect = highlight_protect * (1.0 - lamp_highlight_float)
 
-    exposure = rec.exposure + profile.get("exposure_bias", 0.0)
+    exposure = (rec.exposure + profile.get("exposure_bias", 0.0)) * strength["exposure"]
     if is_people_indoor:
         exposure = max(exposure, 0.08 + profile.get("subject_boost", 0.0))
     if exposure:
@@ -292,16 +324,17 @@ def apply_recommended_adjustments(
         lf = lf * (1.0 + (gain - 1.0) * highlight_protect * (0.55 + 0.45 * subject_weight))
 
     shadow_curve = lf * np.square(1.0 - lf)
-    shadow_strength = rec.shadows * (0.55 if is_people_indoor else 0.75) * profile.get("shadow_mult", 1.0)
+    shadow_strength = rec.shadows * (0.55 if is_people_indoor else 0.75) * profile.get("shadow_mult", 1.0) * strength["shadow"]
     lf = lf + shadow_strength * shadow_curve * (0.65 + 0.55 * subject_weight)
 
-    # Highlight compression keeps pure white anchored, avoiding gray/color blobs on lamps.
+    # Highlight compression: apply it more aggressively on sky/bright outdoor regions to pull down highlights
     if rec.highlights < 0:
         shoulder = np.power(lf, 2.4) * (1.0 - lf)
-        lf = lf + rec.highlights * profile.get("highlight_mult", 1.0) * 0.38 * shoulder
+        sky_pull_factor = 1.0 + 0.85 * sky_bright_outdoor_float
+        lf = lf + rec.highlights * profile.get("highlight_mult", 1.0) * 0.38 * shoulder * sky_pull_factor
 
     lf = np.clip(lf, 0.0, 1.0)
-    contrast = rec.contrast * (0.55 if is_people_indoor else 0.85) * profile.get("contrast_mult", 1.0)
+    contrast = rec.contrast * (0.55 if is_people_indoor else 0.85) * profile.get("contrast_mult", 1.0) * strength["contrast"]
     if contrast:
         lf = lf + contrast * 0.20 * (lf - 0.5) * (1.0 - np.abs(2.0 * lf - 1.0))
 
@@ -315,35 +348,52 @@ def apply_recommended_adjustments(
     rgb = cv2.cvtColor(cv2.merge((l_new, a_new, b_new)), cv2.COLOR_LAB2RGB)
     rgb = _protect_lamp_highlights(rgb)
 
-    # Conservative vibrance. Skin pixels are mostly preserved.
+    # Conservative vibrance, protecting skin, and boosting sky if appropriate
     if rec.vibrance > 0:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
         s_ch = hsv[:, :, 1]
-        vib = rec.vibrance * (0.55 if is_people_indoor else 0.85) * profile.get("vibrance_mult", 1.0)
+        vib = rec.vibrance * (0.55 if is_people_indoor else 0.85) * profile.get("vibrance_mult", 1.0) * strength["vibrance"]
         boosted = s_ch + (255.0 - s_ch) * vib * (1.0 - s_ch / 255.0)
-        s_ch = boosted * (1.0 - 0.82 * skin_mask) + s_ch * (0.82 * skin_mask)
+        
+        # Region-aware sky boost: enrich colors in the sky/outdoor regions (where not skin)
+        sky_boost = sky_bright_outdoor_float * (1.0 - skin_mask_float) * 0.25 * (255.0 - s_ch)
+        sky_boost = sky_boost * (1.0 - lamp_highlight_float)
+        boosted = boosted + sky_boost
+        
+        s_ch = boosted * (1.0 - 0.82 * skin_mask_float) + s_ch * (0.82 * skin_mask_float)
         hsv[:, :, 1] = np.clip(s_ch, 0, 255)
         rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
+    # Region-aware denoise: apply noise filter primarily to the shadow_noise region
     if rec.denoise > 0:
         sigma = 8 + rec.denoise * 16
-        rgb = cv2.bilateralFilter(rgb, 5, sigma, sigma)
+        denoised_rgb = cv2.bilateralFilter(rgb, 5, sigma, sigma)
+        sn_weight = np.clip(0.15 + 0.85 * shadow_noise_float, 0.0, 1.0)
+        rgb = (denoised_rgb.astype(np.float32) * sn_weight[:, :, None] + rgb.astype(np.float32) * (1.0 - sn_weight[:, :, None])).astype(np.uint8)
 
     if rec.clarity > 0:
         blur = cv2.GaussianBlur(rgb, (0, 0), 1.0)
-        amount = rec.clarity * (0.22 if is_people_indoor else 0.36) * profile.get("clarity_mult", 1.0)
+        amount = rec.clarity * (0.22 if is_people_indoor else 0.36) * profile.get("clarity_mult", 1.0) * strength["clarity"]
         clarity_img = np.clip(rgb.astype(np.float32) + amount * (rgb.astype(np.float32) - blur.astype(np.float32)), 0, 255)
-        rgb = (clarity_img * (1.0 - 0.75 * skin_mask[:, :, None]) + rgb.astype(np.float32) * (0.75 * skin_mask[:, :, None])).astype(np.uint8)
+        rgb = (clarity_img * (1.0 - 0.75 * skin_mask_float[:, :, None]) + rgb.astype(np.float32) * (0.75 * skin_mask_float[:, :, None])).astype(np.uint8)
 
     if is_people_indoor:
         lab_skin = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
         l_target = np.maximum(lab_skin[:, :, 0], l.astype(np.float32) + 5.0)
-        skin_strength = np.clip(skin_mask * 0.55, 0.0, 0.55)
+        skin_strength = np.clip(skin_mask_float * 0.55, 0.0, 0.55)
         lab_skin[:, :, 0] = lab_skin[:, :, 0] * (1.0 - skin_strength) + l_target * skin_strength
         rgb = cv2.cvtColor(np.clip(lab_skin, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
+    # Final region-aware highlight neutralization to eliminate color cast artifacts around light sources
+    lamp_mask_float = masks.lamp_highlight.astype(np.float32) / 255.0
+    gray_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[:, :, None]
+    rgb = (rgb.astype(np.float32) * (1.0 - lamp_mask_float[:, :, None]) + 
+           gray_img.astype(np.float32) * lamp_mask_float[:, :, None]).astype(np.uint8)
+
     rgb = _protect_lamp_highlights(rgb)
     return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
 def _lab_luminance(image_np: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB)[:, :, 0].astype(np.float32)
 
@@ -351,19 +401,19 @@ def _lab_luminance(image_np: np.ndarray) -> np.ndarray:
 def _center_luminance_mean(image_np: np.ndarray) -> float:
     l_channel = _lab_luminance(image_np)
     h, w = l_channel.shape
-    crop = l_channel[int(h * 0.22):int(h * 0.78), int(w * 0.18):int(w * 0.72)]
-    return float(np.mean(crop)) if crop.size else float(np.mean(l_channel))
+    crop = l_channel[int(h * 0.25):int(h * 0.75), int(w * 0.2):int(w * 0.7)]
+    return float(np.mean(crop))
 
 
 def _skin_luminance_mean(image_np: np.ndarray) -> float:
     skin = _skin_mask_rgb(image_np) > 0.35
+    if int(np.count_nonzero(skin)) == 0:
+        return 0.0
     l_channel = _lab_luminance(image_np)
-    if int(np.count_nonzero(skin)) < image_np.shape[0] * image_np.shape[1] * 0.01:
-        return _center_luminance_mean(image_np)
     return float(np.mean(l_channel[skin]))
 
 
-def _candidate_quality_score(original: np.ndarray, candidate: np.ndarray, is_raw: bool, profile: str) -> float:
+def _candidate_quality_score(original: np.ndarray, candidate: np.ndarray, is_raw: bool, profile: str, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> float:
     original_analysis = analyze_image(original, is_raw=is_raw)
     candidate_analysis = analyze_image(candidate, is_raw=is_raw)
     score = 100.0
@@ -373,6 +423,16 @@ def _candidate_quality_score(original: np.ndarray, candidate: np.ndarray, is_raw
     candidate_skin_l = _skin_luminance_mean(candidate)
     target_center = 143.0 if original_analysis.has_skin else 132.0
     target_skin = 146.0
+    if batch_context:
+        if batch_context.get("target_center"):
+            target_center = 0.65 * target_center + 0.35 * float(batch_context["target_center"])
+        if batch_context.get("target_skin"):
+            target_skin = 0.70 * target_skin + 0.30 * float(batch_context["target_skin"])
+    if (smart_strength or "").lower() == "event bright":
+        target_center += 4.0
+        target_skin += 3.0
+    elif (smart_strength or "").lower() == "strong pop":
+        target_center += 2.0
 
     score -= abs(candidate_center - target_center) * 0.38
     if original_analysis.has_skin:
@@ -413,8 +473,8 @@ def _resize_for_scoring(image_np: np.ndarray, max_side: int = 900) -> np.ndarray
     h, w = image_np.shape[:2]
     largest = max(h, w)
     if largest <= max_side:
-        return image_np
-    scale = max_side / float(largest)
+        return image_np.copy()
+    scale = max_side / largest
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
     return cv2.resize(image_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -430,29 +490,97 @@ def _profiles_for_analysis(analysis) -> list[str]:
     return ["balanced_pop", "event_pop", "skin_safe", "natural_safe", "people_bright"]
 
 
-def select_best_smart_auto_candidate(image_np: np.ndarray, is_raw: bool = False) -> tuple[np.ndarray, str, float]:
+def _score_smart_auto_profiles(image_np: np.ndarray, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> tuple[str, float, list[tuple[str, float]], np.ndarray]:
     scoring_source = _resize_for_scoring(image_np)
+    
+    # Detect masks once on the small scoring preview to keep scoring fast!
+    from app.region_detection import detect_regions
+    masks = detect_regions(scoring_source, is_raw=is_raw)
+    
     profiles = _profiles_for_analysis(analyze_image(scoring_source, is_raw=is_raw))
     if _center_luminance_mean(scoring_source) > 150.0:
         profiles = [profile for profile in profiles if profile in {"natural_safe", "skin_safe", "balanced_pop", "highlight_safe"}] or ["natural_safe"]
+
+    scored: list[tuple[str, float]] = []
     best_profile = "natural_safe"
     best_score = -1e9
     for profile in profiles:
-        preview_candidate = apply_recommended_adjustments(scoring_source, is_raw=is_raw, candidate_profile=profile)
-        score = _candidate_quality_score(scoring_source, preview_candidate, is_raw, profile)
+        preview_candidate = apply_recommended_adjustments(scoring_source, is_raw=is_raw, candidate_profile=profile, smart_strength=smart_strength, masks=masks)
+        score = _candidate_quality_score(scoring_source, preview_candidate, is_raw, profile, batch_context=batch_context, smart_strength=smart_strength)
+        scored.append((profile, score))
         if score > best_score:
             best_profile = profile
             best_score = score
     if best_score < 20.0 and _center_luminance_mean(scoring_source) > 145.0:
-        return image_np.copy(), "original_safe", best_score
-    best_image = apply_recommended_adjustments(image_np, is_raw=is_raw, candidate_profile=best_profile)
+        best_profile = "original_safe"
+    return best_profile, best_score, sorted(scored, key=lambda item: item[1], reverse=True), scoring_source
+
+
+def select_best_smart_auto_candidate(image_np: np.ndarray, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> tuple[np.ndarray, str, float]:
+    best_profile, best_score, _, _ = _score_smart_auto_profiles(image_np, is_raw=is_raw, batch_context=batch_context, smart_strength=smart_strength)
+    if best_profile == "original_safe":
+        return image_np.copy(), best_profile, best_score
+    best_image = apply_recommended_adjustments(image_np, is_raw=is_raw, candidate_profile=best_profile, smart_strength=smart_strength)
     return best_image, best_profile, best_score
 
 
-def get_smart_auto_profile_name(image_np: np.ndarray, is_raw: bool = False) -> str:
+def get_smart_auto_profile_name(image_np: np.ndarray, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> str:
     """Return the Smart Auto v4 profile selected for this image."""
-    _, profile, _ = select_best_smart_auto_candidate(image_np, is_raw=is_raw)
+    profile, _, _, _ = _score_smart_auto_profiles(image_np, is_raw=is_raw, batch_context=batch_context, smart_strength=smart_strength)
     return profile
+
+
+def get_smart_auto_decision(image_np: np.ndarray, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> dict:
+    """Return selected Smart Auto profile, score, and candidate ranking."""
+    profile, score, scored, _ = _score_smart_auto_profiles(image_np, is_raw=is_raw, batch_context=batch_context, smart_strength=smart_strength)
+    return {
+        "profile": profile,
+        "score": float(score),
+        "candidates": [(name, float(value)) for name, value in scored],
+    }
+
+
+def save_smart_auto_contact_sheet(image_np: np.ndarray, output_path: str, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> str:
+    """Save a JPEG contact sheet with original and Smart Auto v4 candidates."""
+    from PIL import Image, ImageDraw
+    import os
+
+    selected, _, scored, scoring_source = _score_smart_auto_profiles(image_np, is_raw=is_raw, batch_context=batch_context, smart_strength=smart_strength)
+    from app.region_detection import detect_regions
+    masks = detect_regions(scoring_source, is_raw=is_raw)
+    
+    tiles: list[tuple[str, np.ndarray]] = [("original", scoring_source)]
+    for profile, _ in scored:
+        tiles.append((profile, apply_recommended_adjustments(scoring_source, is_raw=is_raw, candidate_profile=profile, smart_strength=smart_strength, masks=masks)))
+    if selected == "original_safe":
+        tiles.append(("selected: original_safe", scoring_source.copy()))
+
+    tile_w = 360
+    tile_h = 240
+    label_h = 34
+    cols = 3
+    rows = int(np.ceil(len(tiles) / cols))
+    sheet = Image.new("RGB", (cols * tile_w, rows * (tile_h + label_h)), (30, 30, 30))
+    draw = ImageDraw.Draw(sheet)
+    score_lookup = {name: score for name, score in scored}
+
+    for index, (name, arr) in enumerate(tiles):
+        row, col = divmod(index, cols)
+        pil = Image.fromarray(arr).convert("RGB")
+        pil.thumbnail((tile_w, tile_h), Image.Resampling.LANCZOS)
+        x = col * tile_w + (tile_w - pil.width) // 2
+        y = row * (tile_h + label_h) + label_h + (tile_h - pil.height) // 2
+        sheet.paste(pil, (x, y))
+        label = name
+        if name in score_lookup:
+            label += f" ({score_lookup[name]:.1f})"
+        if name == selected or (selected == "original_safe" and name.startswith("selected")):
+            label = "BEST: " + label
+        draw.text((col * tile_w + 8, row * (tile_h + label_h) + 8), label, fill=(255, 255, 255))
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    sheet.save(output_path, "JPEG", quality=90)
+    return output_path
 
 
 def correct_raw_corner_shading(image_np: np.ndarray, strength: float = 0.95) -> np.ndarray:
@@ -613,12 +741,12 @@ def lift_shadows_and_protect_highlights(image_np: np.ndarray, shadow_lift: float
 
     return np.clip(img_float, 0, 255).astype(np.uint8)
 
-def smart_auto_enhance(image_np: np.ndarray, is_raw: bool = False) -> np.ndarray:
+def smart_auto_enhance(image_np: np.ndarray, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> np.ndarray:
     """Choose the best Smart Auto candidate for this specific image."""
-    best_image, _, _ = select_best_smart_auto_candidate(image_np, is_raw=is_raw)
+    best_image, _, _ = select_best_smart_auto_candidate(image_np, is_raw=is_raw, batch_context=batch_context, smart_strength=smart_strength)
     return best_image
 
-def apply_autocorrect(image_np: np.ndarray, mode: str, is_raw: bool = False) -> np.ndarray:
+def apply_autocorrect(image_np: np.ndarray, mode: str, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> np.ndarray:
     """
     Applies the chosen autocorrect mode to the image.
     """
@@ -626,7 +754,7 @@ def apply_autocorrect(image_np: np.ndarray, mode: str, is_raw: bool = False) -> 
     
     # Default to smart auto if Smart Auto is selected
     if "smart" in mode_clean or "auto" in mode_clean:
-        return smart_auto_enhance(image_np, is_raw=is_raw)
+        return smart_auto_enhance(image_np, is_raw=is_raw, batch_context=batch_context, smart_strength=smart_strength)
         
     if mode_clean == "off" or not mode_clean:
         return image_np

@@ -145,23 +145,32 @@ class MainWindow(QMainWindow):
         self.cmb_autocorrect.addItems(["Smart Auto (Recommended)", "Off", "Natural", "Bright", "Vivid", "Low Light"])
         photo_layout.addWidget(self.cmb_autocorrect, 6, 1)
 
+        photo_layout.addWidget(QLabel("Smart strength:"), 7, 0)
+        self.cmb_smart_strength = QComboBox()
+        self.cmb_smart_strength.addItems(["Event Balanced", "Natural", "Event Bright", "Strong Pop"])
+        photo_layout.addWidget(self.cmb_smart_strength, 7, 1)
+
         # Camera WB & Copy EXIF
         self.cb_camera_wb = QCheckBox("Use Camera White Balance")
         self.cb_camera_wb.setChecked(True)
-        photo_layout.addWidget(self.cb_camera_wb, 7, 0, 1, 2)
+        photo_layout.addWidget(self.cb_camera_wb, 8, 0, 1, 2)
 
         self.cb_copy_exif = QCheckBox("Copy EXIF Metadata")
         self.cb_copy_exif.setChecked(True)
-        photo_layout.addWidget(self.cb_copy_exif, 8, 0, 1, 2)
+        photo_layout.addWidget(self.cb_copy_exif, 9, 0, 1, 2)
 
         self.cb_raw_corner_shading = QCheckBox("Correct RAW corner shading / vignette")
         self.cb_raw_corner_shading.setChecked(True)
-        photo_layout.addWidget(self.cb_raw_corner_shading, 9, 0, 1, 2)
+        photo_layout.addWidget(self.cb_raw_corner_shading, 10, 0, 1, 2)
 
-        photo_layout.addWidget(QLabel("RAW Engine:"), 10, 0)
+        self.cb_save_ai_debug = QCheckBox("Save AI Detection Debug Overlay (_ai_debug.jpg)")
+        self.cb_save_ai_debug.setChecked(False)
+        photo_layout.addWidget(self.cb_save_ai_debug, 11, 0, 1, 2)
+
+        photo_layout.addWidget(QLabel("RAW Engine:"), 12, 0)
         self.cmb_raw_engine = QComboBox()
         self.cmb_raw_engine.addItems([engine.value for engine in RawEngine])
-        photo_layout.addWidget(self.cmb_raw_engine, 10, 1)
+        photo_layout.addWidget(self.cmb_raw_engine, 12, 1)
 
         detected_engines = detect_raw_engines()
         engine_status = []
@@ -170,12 +179,12 @@ class MainWindow(QMainWindow):
         self.lbl_raw_engine_status = QLabel(" | ".join(engine_status))
         self.lbl_raw_engine_status.setStyleSheet("color: #666; font-size: 11px;")
         self.lbl_raw_engine_status.setWordWrap(True)
-        photo_layout.addWidget(self.lbl_raw_engine_status, 11, 0, 1, 2)
+        photo_layout.addWidget(self.lbl_raw_engine_status, 13, 0, 1, 2)
 
         # Photo suffix
-        photo_layout.addWidget(QLabel("Photo suffix:"), 12, 0)
+        photo_layout.addWidget(QLabel("Photo suffix:"), 14, 0)
         self.txt_photo_suffix = QLineEdit("")
-        photo_layout.addWidget(self.txt_photo_suffix, 12, 1)
+        photo_layout.addWidget(self.txt_photo_suffix, 14, 1)
 
         manual_group = QGroupBox("Manual Basic Adjustments")
         manual_layout = QGridLayout(manual_group)
@@ -493,8 +502,10 @@ class MainWindow(QMainWindow):
             'photo_keep_resolution': self.cb_photo_resolution.isChecked(),
             'photo_autocorrect': self.cmb_autocorrect.currentText(),
             'photo_camera_wb': self.cb_camera_wb.isChecked(),
+            'smart_auto_strength': self.cmb_smart_strength.currentText(),
             'photo_copy_exif': self.cb_copy_exif.isChecked(),
             'photo_correct_corner_shading': self.cb_raw_corner_shading.isChecked(),
+            'save_ai_debug': self.cb_save_ai_debug.isChecked(),
             'raw_engine': self.cmb_raw_engine.currentText(),
             'photo_export_preset': self.cmb_photo_export_preset.currentText(),
             'photo_max_dimension': self.cmb_photo_max_dimension.currentText(),

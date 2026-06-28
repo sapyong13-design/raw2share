@@ -97,3 +97,11 @@ def test_analysis_detects_person_like_center_subject():
     analysis = analyze_image(img, is_raw=False)
     assert analysis.subject_ratio > 0
     assert analysis.has_subject
+
+
+def test_analysis_exposes_face_detection_fields():
+    img = np.full((96, 96, 3), 128, dtype=np.uint8)
+    analysis = analyze_image(img, is_raw=False)
+    assert isinstance(analysis.face_count, int)
+    assert analysis.face_ratio >= 0.0
+    assert isinstance(analysis.has_face, bool)

@@ -2,7 +2,7 @@ import os
 import rawpy
 from io import BytesIO
 from PIL import Image, ImageFile
-from app.autocorrect import apply_autocorrect, correct_raw_corner_shading
+from app.autocorrect import apply_autocorrect, correct_raw_corner_shading, get_smart_auto_decision, save_smart_auto_contact_sheet
 from app.adjustment_engine import AdjustmentSettings, apply_adjustments, calculate_resize
 from app.metadata import copy_exif_metadata
 from app.image_analysis import analyze_image
@@ -17,6 +17,37 @@ from app.raw_engine import (
 )
 
 ImageFile.MAXBLOCK = 2**26  # 64 MB
+
+def _is_smart_auto_mode(mode: str) -> bool:
+    mode_clean = (mode or "").strip().lower()
+    return "smart" in mode_clean or "auto" in mode_clean
+
+def _append_smart_auto_metadata(message_parts: list[str], rgb_img, is_raw: bool, settings: dict, output_path: str) -> None:
+    mode = settings.get('autocorrect_mode', 'Off')
+    if not _is_smart_auto_mode(mode):
+        return
+    decision = get_smart_auto_decision(rgb_img, is_raw=is_raw, batch_context=settings.get('batch_context'), smart_strength=settings.get('smart_auto_strength', 'Event Balanced'))
+    top = ", ".join(f"{name}:{score:.1f}" for name, score in decision.get('candidates', [])[:3])
+    message_parts.append(f"Smart Auto: {decision.get('profile')} ({decision.get('score', 0):.1f}).")
+    if top:
+        message_parts.append(f"Top candidates: {top}.")
+    if settings.get('save_contact_sheet', True):
+        import os
+        base, _ = os.path.splitext(output_path)
+        sheet_path = f"{base}_smartauto_candidates.jpg"
+        save_smart_auto_contact_sheet(rgb_img, sheet_path, is_raw=is_raw, batch_context=settings.get('batch_context'), smart_strength=settings.get('smart_auto_strength', 'Event Balanced'))
+        message_parts.append(f"Candidates: {os.path.basename(sheet_path)}.")
+    if settings.get('save_ai_debug', False):
+        from app.region_detection import detect_regions, generate_region_debug_sheet
+        from PIL import Image
+        import os
+        base, _ = os.path.splitext(output_path)
+        debug_sheet_path = f"{base}_ai_debug.jpg"
+        masks = detect_regions(rgb_img, is_raw=is_raw)
+        debug_sheet_np = generate_region_debug_sheet(rgb_img, masks)
+        debug_sheet_pil = Image.fromarray(debug_sheet_np)
+        debug_sheet_pil.save(debug_sheet_path, "JPEG", quality=85)
+        message_parts.append(f"AI Debug: {os.path.basename(debug_sheet_path)}.")
 
 def _image_is_too_overexposed(img_pil: Image.Image) -> bool:
     """Detect camera previews that are too clipped to use as RAW base."""
@@ -58,6 +89,7 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
 
         size_before = os.path.getsize(input_path)
         photo_reasoning = ""
+        smart_auto_messages = []
         
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -73,7 +105,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                 rgb_img = np.array(img_pil.convert('RGB'))
                 analysis = analyze_image(rgb_img, is_raw=False)
                 photo_reasoning = analysis.reasoning
-                rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=False)
+                _append_smart_auto_metadata(smart_auto_messages, rgb_img, False, settings, output_path)
+                rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=False, batch_context=settings.get('batch_context'), smart_strength=settings.get('smart_auto_strength', 'Event Balanced'))
                 img_pil = Image.fromarray(rgb_img)
         else:
             autocorrect_mode = settings.get('autocorrect_mode', 'Off')
@@ -133,7 +166,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                         analysis = analyze_image(rgb_img, is_raw=True)
                         raw_scene = analysis.scene
                         photo_reasoning = analysis.reasoning
-                        rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=True)
+                        _append_smart_auto_metadata(smart_auto_messages, rgb_img, True, settings, output_path)
+                        rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=True, batch_context=settings.get('batch_context'), smart_strength=settings.get('smart_auto_strength', 'Event Balanced'))
                         img_pil = Image.fromarray(rgb_img)
                 else:
                     use_camera_wb = settings.get('use_camera_wb', True)
@@ -144,7 +178,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                     analysis = analyze_image(rgb_img, is_raw=True)
                     raw_scene = analysis.scene
                     photo_reasoning = analysis.reasoning
-                    rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=True)
+                    _append_smart_auto_metadata(smart_auto_messages, rgb_img, True, settings, output_path)
+                    rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=True, batch_context=settings.get('batch_context'), smart_strength=settings.get('smart_auto_strength', 'Event Balanced'))
                     img_pil = Image.fromarray(rgb_img)
 
             if used_embedded_preview:
@@ -156,7 +191,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                 raw_scene = analysis.scene
                 photo_reasoning = analysis.reasoning
                 if autocorrect_mode != 'Off':
-                    rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=False)
+                    _append_smart_auto_metadata(smart_auto_messages, rgb_img, False, settings, output_path)
+                    rgb_img = apply_autocorrect(rgb_img, autocorrect_mode, is_raw=False, batch_context=settings.get('batch_context'), smart_strength=settings.get('smart_auto_strength', 'Event Balanced'))
                 img_pil = Image.fromarray(rgb_img)
             elif used_external_engine:
                 analysis = analyze_image(np.array(img_pil.convert('RGB')), is_raw=True)
@@ -211,6 +247,11 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
             message += f" Scene: {raw_scene}."
         if photo_reasoning:
             message += f" Analysis: {photo_reasoning}"
+        if smart_auto_messages:
+            message += " " + " ".join(smart_auto_messages)
+        batch_profile = settings.get('batch_profile')
+        if batch_profile:
+            message += f" Batch consistency: {batch_profile}."
         if 'used_embedded_preview' in locals() and used_embedded_preview:
             message += " Used embedded full-size camera JPEG preview as RAW base."
         if 'used_external_engine' in locals() and used_external_engine:

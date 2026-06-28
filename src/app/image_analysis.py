@@ -21,6 +21,9 @@ class ImageAnalysis:
     has_skin: bool
     subject_ratio: float
     has_subject: bool
+    face_count: int
+    face_ratio: float
+    has_face: bool
     reasoning: str
 
 
@@ -81,6 +84,28 @@ def _estimate_vignette(luminance: np.ndarray) -> float:
     return max(0.0, min(1.0, (center_mean - corner_mean) / center_mean))
 
 
+def _detect_faces(gray: np.ndarray) -> tuple[int, float]:
+    try:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            return 0, 0.0
+        scale = 1.0
+        small = gray
+        largest = max(gray.shape)
+        if largest > 900:
+            scale = 900.0 / largest
+            small = cv2.resize(gray, (max(1, int(gray.shape[1] * scale)), max(1, int(gray.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+        faces = cascade.detectMultiScale(small, scaleFactor=1.1, minNeighbors=5, minSize=(24, 24))
+        if len(faces) == 0:
+            return 0, 0.0
+        area = 0.0
+        for _, _, width, height in faces:
+            area += float(width * height) / max(scale * scale, 1e-6)
+        return int(len(faces)), float(min(1.0, area / float(gray.shape[0] * gray.shape[1])))
+    except Exception:
+        return 0, 0.0
+
 def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
     rgb = image_np[:, :, :3]
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
@@ -132,7 +157,11 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
     center_deviation = np.abs(gray.astype(np.float32) - overall_mean) > 25
     subject_mask = (center_deviation | (skin_mask > 0)) & center_region
     subject_ratio = float(np.mean(subject_mask))
-    has_subject = bool(subject_ratio > 0.02)
+    face_count, face_ratio = _detect_faces(gray)
+    has_face = bool(face_count > 0)
+    if has_face:
+        subject_ratio = max(subject_ratio, min(0.35, face_ratio * 4.0))
+    has_subject = bool(subject_ratio > 0.02 or has_face)
 
     reasons = []
     reasons.append(f"Scene: {scene} ({exposure}).")
@@ -140,6 +169,8 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
         reasons.append("Highlight clipping / bright spots detected.")
     if skin_ratio > 0.05:
         reasons.append(f"Skin tones present ({skin_ratio:.1%}).")
+    if has_face:
+        reasons.append(f"Face detected ({face_count}).")
     if has_subject:
         reasons.append(f"Subject in center ({subject_ratio:.1%}).")
     if vignette_strength > 0.10:
@@ -164,6 +195,9 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
         has_skin=has_skin,
         subject_ratio=subject_ratio,
         has_subject=has_subject,
+        face_count=face_count,
+        face_ratio=face_ratio,
+        has_face=has_face,
         reasoning=reasoning,
     )
 

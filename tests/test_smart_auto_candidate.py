@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 
-from app.autocorrect import get_smart_auto_profile_name, smart_auto_enhance, select_best_smart_auto_candidate
+from app.autocorrect import get_smart_auto_decision, get_smart_auto_profile_name, save_smart_auto_contact_sheet, smart_auto_enhance, select_best_smart_auto_candidate
 
 
 def _center_luminance(image):
@@ -34,3 +34,30 @@ def test_smart_auto_enhance_returns_uint8_same_shape():
     result = smart_auto_enhance(image, is_raw=False)
     assert result.shape == image.shape
     assert result.dtype == np.uint8
+
+
+def test_smart_auto_decision_and_contact_sheet(tmp_path):
+    image = np.full((80, 120, 3), [170, 155, 130], dtype=np.uint8)
+    image[25:65, 35:70] = [185, 128, 92]
+    decision = get_smart_auto_decision(image, is_raw=False)
+    assert decision["profile"]
+    assert isinstance(decision["score"], float)
+    assert decision["candidates"]
+
+    sheet_path = tmp_path / "candidates.jpg"
+    result = save_smart_auto_contact_sheet(image, str(sheet_path), is_raw=False)
+    assert result == str(sheet_path)
+    assert sheet_path.exists()
+    assert sheet_path.stat().st_size > 0
+
+
+def test_smart_auto_strength_and_batch_context_are_accepted():
+    image = np.full((80, 120, 3), [160, 145, 120], dtype=np.uint8)
+    image[25:65, 35:70] = [180, 125, 90]
+    context = {"dominant_scene": "indoor_balanced", "target_center": 138.0, "target_skin": 144.0, "sample_count": 4}
+    result, profile, score = select_best_smart_auto_candidate(image, is_raw=False, batch_context=context, smart_strength="Event Bright")
+    assert result.shape == image.shape
+    assert profile
+    assert isinstance(score, float)
+    decision = get_smart_auto_decision(image, is_raw=False, batch_context=context, smart_strength="Event Bright")
+    assert decision["profile"] == profile

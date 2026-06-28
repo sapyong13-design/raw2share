@@ -4,6 +4,7 @@ from app.photo_converter import convert_raw_to_jpg
 from app.video_converter import convert_video
 from app.utils import get_unique_filepath, format_size
 from app.file_scanner import is_photo, is_video
+from app.image_analysis import analyze_image
 
 class ConversionWorker(QThread):
     # Signals to communicate with the GUI thread
@@ -45,8 +46,60 @@ class ConversionWorker(QThread):
     def check_cancel(self) -> bool:
         return self._is_cancelled
 
+    def _batch_profile_label(self) -> str:
+        photo_count = sum(1 for item in self.queue if item.get('type') == 'Photo')
+        if photo_count <= 1:
+            return ""
+        if self.settings.get('photo_auto_each', True):
+            return "per-photo"
+        return "batch-consistent"
+
+    def _build_batch_context(self) -> dict:
+        if self.settings.get('photo_auto_each', True):
+            return {}
+        centers = []
+        skins = []
+        scenes = []
+        try:
+            from PIL import Image
+            import numpy as np
+            import os
+            import cv2
+            from app.autocorrect import _center_luminance_mean, _skin_luminance_mean
+            for item in self.queue[:24]:
+                if item.get('type') != 'Photo':
+                    continue
+                path = item.get('input_path', '')
+                if os.path.splitext(path.lower())[1] not in ('.jpg', '.jpeg'):
+                    continue
+                img = np.array(Image.open(path).convert('RGB'))
+                if max(img.shape[:2]) > 900:
+                    scale = 900.0 / max(img.shape[:2])
+                    img = cv2.resize(img, (max(1, int(img.shape[1] * scale)), max(1, int(img.shape[0] * scale))), interpolation=cv2.INTER_AREA)
+                analysis = analyze_image(img, is_raw=False)
+                scenes.append(analysis.scene)
+                centers.append(_center_luminance_mean(img))
+                skins.append(_skin_luminance_mean(img))
+        except Exception:
+            return {}
+        if not centers:
+            return {}
+        dominant_scene = max(set(scenes), key=scenes.count) if scenes else ''
+        return {
+            'dominant_scene': dominant_scene,
+            'target_center': float(np.median(centers)),
+            'target_skin': float(np.median(skins)) if skins else 0.0,
+            'sample_count': len(centers),
+        }
+
     def run(self):
+        batch_profile = self._batch_profile_label()
+        batch_context = self._build_batch_context()
         self.log_message.emit("Batch processing started.")
+        if batch_profile:
+            self.log_message.emit(f"Smart Auto batch mode: {batch_profile}.")
+        if batch_context:
+            self.log_message.emit(f"Batch consistency target: scene={batch_context.get('dominant_scene')}, center={batch_context.get('target_center'):.1f}, samples={batch_context.get('sample_count')}.")
         
         for item in self.queue:
             if self._is_cancelled:
@@ -121,7 +174,11 @@ class ConversionWorker(QThread):
                     'correct_corner_shading': self.settings.get('photo_correct_corner_shading', True),
                     'raw_engine': self.settings.get('raw_engine', 'Auto (Recommended)'),
                     'max_dimension': self._parse_max_dimension(self.settings.get('photo_max_dimension', 'Original')),
-                    'manual_adjustments': self.settings.get('manual_adjustments', {})
+                    'manual_adjustments': self.settings.get('manual_adjustments', {}),
+                    'batch_profile': batch_profile,
+                    'batch_context': batch_context,
+                    'smart_auto_strength': self.settings.get('smart_auto_strength', 'Event Balanced'),
+                    'save_ai_debug': self.settings.get('save_ai_debug', False)
                 }
                 
                 # Photos conversion is typically fast, so we check cancel just before/after
