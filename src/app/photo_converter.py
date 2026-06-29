@@ -93,6 +93,13 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
         
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Extract EXIF metadata stats and add to batch_context for Autocorrect V4
+        from app.autocorrect import extract_metadata_stats
+        meta_stats = extract_metadata_stats(input_path)
+        if 'batch_context' not in settings or settings['batch_context'] is None:
+            settings['batch_context'] = {}
+        settings['batch_context']['metadata'] = meta_stats
 
         _, ext = os.path.splitext(input_path.lower())
         if ext in ('.jpg', '.jpeg'):
@@ -162,7 +169,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                         rgb_img = raw.postprocess(use_camera_wb=use_camera_wb, no_auto_bright=False, output_bps=8)
                         raw_engine_used = "LibRaw/rawpy fallback"
                         if settings.get('correct_corner_shading', True):
-                            rgb_img = correct_raw_corner_shading(rgb_img)
+                            meta_stats = settings.get('batch_context', {}).get('metadata') if settings.get('batch_context') else None
+                            rgb_img = correct_raw_corner_shading(rgb_img, metadata=meta_stats)
                         analysis = analyze_image(rgb_img, is_raw=True)
                         raw_scene = analysis.scene
                         photo_reasoning = analysis.reasoning
@@ -174,7 +182,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                     rgb_img = raw.postprocess(use_camera_wb=use_camera_wb, no_auto_bright=False, output_bps=8)
                     raw_engine_used = "LibRaw/rawpy"
                     if settings.get('correct_corner_shading', True):
-                        rgb_img = correct_raw_corner_shading(rgb_img)
+                        meta_stats = settings.get('batch_context', {}).get('metadata') if settings.get('batch_context') else None
+                        rgb_img = correct_raw_corner_shading(rgb_img, metadata=meta_stats)
                     analysis = analyze_image(rgb_img, is_raw=True)
                     raw_scene = analysis.scene
                     photo_reasoning = analysis.reasoning
@@ -186,7 +195,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                 import numpy as np
                 rgb_img = np.array(img_pil.convert('RGB'))
                 if settings.get('correct_corner_shading', True):
-                    rgb_img = correct_raw_corner_shading(rgb_img, strength=0.65)
+                    meta_stats = settings.get('batch_context', {}).get('metadata') if settings.get('batch_context') else None
+                    rgb_img = correct_raw_corner_shading(rgb_img, strength=0.65, metadata=meta_stats)
                 analysis = analyze_image(rgb_img, is_raw=False)
                 raw_scene = analysis.scene
                 photo_reasoning = analysis.reasoning

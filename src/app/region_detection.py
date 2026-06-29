@@ -12,12 +12,18 @@ class RegionMasks:
     shadow_noise: np.ndarray     # uint8, 0-255
     neutral_wall_floor: np.ndarray# uint8, 0-255
 
+_region_cache = {}
+
 def detect_regions(image_np: np.ndarray, is_raw: bool = False) -> RegionMasks:
     """
     Detect different semantic regions in an RGB image.
     Performs detection on a downscaled version for speed, then upscales the masks
     back to the original image dimensions.
     """
+    key = (id(image_np), image_np.shape, is_raw, int(image_np.flat[0]), int(image_np.flat[-1]), float(image_np.flat[::2000].sum()) if image_np.size > 2000 else float(image_np.sum()))
+    if key in _region_cache:
+        return _region_cache[key]
+        
     h_orig, w_orig = image_np.shape[:2]
     
     # Downscale for fast processing
@@ -125,7 +131,7 @@ def detect_regions(image_np: np.ndarray, is_raw: bool = False) -> RegionMasks:
             return cv2.resize(mask, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
         return mask
         
-    return RegionMasks(
+    res = RegionMasks(
         face_person=upscale_mask(face_person_mask),
         skin=upscale_mask(skin_mask),
         lamp_highlight=upscale_mask(lamp_highlight),
@@ -134,6 +140,10 @@ def detect_regions(image_np: np.ndarray, is_raw: bool = False) -> RegionMasks:
         shadow_noise=upscale_mask(shadow_noise),
         neutral_wall_floor=upscale_mask(neutral_wall_floor)
     )
+    if len(_region_cache) > 30:
+        _region_cache.clear()
+    _region_cache[key] = res
+    return res
 
 def generate_region_debug_sheet(image_np: np.ndarray, masks: RegionMasks) -> np.ndarray:
     """

@@ -106,7 +106,13 @@ def _detect_faces(gray: np.ndarray) -> tuple[int, float]:
     except Exception:
         return 0, 0.0
 
+_analysis_cache = {}
+
 def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
+    key = (id(image_np), image_np.shape, is_raw, int(image_np.flat[0]), int(image_np.flat[-1]), float(image_np.flat[::2000].sum()) if image_np.size > 2000 else float(image_np.sum()))
+    if key in _analysis_cache:
+        return _analysis_cache[key]
+        
     rgb = image_np[:, :, :3]
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
@@ -177,7 +183,7 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
         reasons.append(f"Vignette detected ({vignette_strength:.2f}).")
     reasoning = " ".join(reasons)
 
-    return ImageAnalysis(
+    res = ImageAnalysis(
         mean_luminance=mean_luminance,
         p5_luminance=float(p5),
         p50_luminance=float(p50),
@@ -200,6 +206,10 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
         has_face=has_face,
         reasoning=reasoning,
     )
+    if len(_analysis_cache) > 50:
+        _analysis_cache.clear()
+    _analysis_cache[key] = res
+    return res
 
 
 def recommend_adjustments(analysis: ImageAnalysis) -> AdjustmentRecommendation:
