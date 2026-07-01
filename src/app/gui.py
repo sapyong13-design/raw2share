@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QTextEdit, QSplitter, QHeaderView, QAbstractItemView
 )
 from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QDragMoveEvent
 
 from app.file_scanner import scan_paths, is_photo, is_video
 from app.workers import ConversionWorker
@@ -290,6 +290,17 @@ class MainWindow(QMainWindow):
 
         bottom_widget.addWidget(log_panel)
         
+        # Setup drag and drop for table and log display to make drop operations robust
+        self.table.setAcceptDrops(True)
+        self.table.dragEnterEvent = self.dragEnterEvent
+        self.table.dragMoveEvent = self.dragMoveEvent
+        self.table.dropEvent = self.dropEvent
+
+        self.log_display.setAcceptDrops(True)
+        self.log_display.dragEnterEvent = self.dragEnterEvent
+        self.log_display.dragMoveEvent = self.dragMoveEvent
+        self.log_display.dropEvent = self.dropEvent
+
         # Set splitter sizes
         main_splitter.setSizes([300, 400])
         bottom_widget.setSizes([700, 300])
@@ -336,6 +347,10 @@ class MainWindow(QMainWindow):
 
     # Drag and Drop handlers
     def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event: QDragMoveEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
