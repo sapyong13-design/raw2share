@@ -229,7 +229,16 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
             w, h = img_pil.size
             new_w, new_h = calculate_resize(w, h, int(max_dimension))
             if (new_w, new_h) != (w, h):
-                img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                from app.utils import is_legacy_pc
+                if is_legacy_pc():
+                    # Fast resizing using OpenCV (INTER_AREA is highly optimized and multithreaded)
+                    import cv2
+                    import numpy as np
+                    np_img = np.array(img_pil)
+                    resized_np = cv2.resize(np_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    img_pil = Image.fromarray(resized_np)
+                else:
+                    img_pil = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         # Save to JPG
         quality = settings.get('quality', 98)
