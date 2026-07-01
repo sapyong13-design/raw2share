@@ -26,8 +26,11 @@ def detect_regions(image_np: np.ndarray, is_raw: bool = False) -> RegionMasks:
         
     h_orig, w_orig = image_np.shape[:2]
     
+    from app.utils import is_legacy_pc
+    legacy = is_legacy_pc()
+    
     # Downscale for fast processing
-    max_dim = 1024
+    max_dim = 512 if legacy else 1024
     scale = 1.0
     if max(h_orig, w_orig) > max_dim:
         scale = max_dim / max(h_orig, w_orig)
@@ -58,22 +61,23 @@ def detect_regions(image_np: np.ndarray, is_raw: bool = False) -> RegionMasks:
     
     # 3. Face & Person Mask
     face_mask = np.zeros((h, w), dtype=np.uint8)
-    try:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        cascade = cv2.CascadeClassifier(cascade_path)
-        if not cascade.empty():
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
-            for (x, y, fw, fh) in faces:
-                # Draw face
-                cv2.rectangle(face_mask, (x, y), (x + fw, y + fh), 255, -1)
-                # Draw body/shoulder extension
-                bx = max(0, x - int(fw * 0.4))
-                by = y + fh
-                bw = min(w, x + fw + int(fw * 0.4))
-                bh = min(h, y + fh + int(fh * 2.5))
-                cv2.rectangle(face_mask, (bx, by), (bw, bh), 180, -1)
-    except Exception:
-        pass
+    if not legacy:
+        try:
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            cascade = cv2.CascadeClassifier(cascade_path)
+            if not cascade.empty():
+                faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(20, 20))
+                for (x, y, fw, fh) in faces:
+                    # Draw face
+                    cv2.rectangle(face_mask, (x, y), (x + fw, y + fh), 255, -1)
+                    # Draw body/shoulder extension
+                    bx = max(0, x - int(fw * 0.4))
+                    by = y + fh
+                    bw = min(w, x + fw + int(fw * 0.4))
+                    bh = min(h, y + fh + int(fh * 2.5))
+                    cv2.rectangle(face_mask, (bx, by), (bw, bh), 180, -1)
+        except Exception:
+            pass
         
     # If no faces/people detected, fallback to center region ellipse
     if np.mean(face_mask) < 1.0:

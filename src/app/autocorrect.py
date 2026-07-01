@@ -367,7 +367,8 @@ def bilateral_grid_smooth(L: np.ndarray, s_space: int = 16, s_range: float = 0.1
         return _bilateral_cache[key]
         
     h_orig, w_orig = L.shape
-    max_dim = 1024
+    from app.utils import is_legacy_pc
+    max_dim = 384 if is_legacy_pc() else 1024
     scale = 1.0
     if max(h_orig, w_orig) > max_dim:
         scale = max_dim / max(h_orig, w_orig)
@@ -1049,6 +1050,19 @@ def _score_smart_auto_profiles(image_np: np.ndarray, is_raw: bool = False, batch
     from app.region_detection import detect_regions
     masks = detect_regions(scoring_source, is_raw=is_raw)
     
+    from app.utils import is_legacy_pc
+    if is_legacy_pc():
+        analysis = analyze_image(scoring_source, is_raw=is_raw)
+        if analysis.scene == "low_light":
+            best_profile = "low_light_people"
+        elif analysis.scene in {"indoor_balanced", "backlit_high_contrast"}:
+            best_profile = "event_bright"
+        elif analysis.scene == "outdoor_highlight":
+            best_profile = "highlight_safe"
+        else:
+            best_profile = "balanced_pop"
+        return best_profile, 99.0, [(best_profile, 99.0)], scoring_source
+        
     profiles = _profiles_for_analysis(analyze_image(scoring_source, is_raw=is_raw))
     if _center_luminance_mean(scoring_source) > 150.0:
         profiles = [profile for profile in profiles if profile in {"natural_safe", "skin_safe", "balanced_pop", "highlight_safe"}] or ["natural_safe"]
