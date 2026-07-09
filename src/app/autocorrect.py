@@ -543,10 +543,11 @@ def apply_hdr_fusion(image_np: np.ndarray, masks) -> np.ndarray:
     over = img_float * (2.0 ** 1.2)
     
     shadow_mask = (masks.shadow_noise.astype(np.float32) / 255.0)[:, :, None]
-    high_mask = ((masks.lamp_highlight + masks.sky_bright_outdoor) / 2.0).astype(np.float32) / 255.0
-    high_mask = np.clip(high_mask, 0.0, 1.0)[:, :, None]
-    
-    hdr = img_float * (1.0 - shadow_mask - high_mask) + over * shadow_mask + under * high_mask
+    high_mask = (masks.lamp_highlight.astype(np.float32) / 255.0)[:, :, None]
+    high_mask = np.clip(high_mask, 0.0, 1.0)
+    shadow_weight = np.clip(shadow_mask * (1.0 - high_mask), 0.0, 1.0)
+    base_weight = np.clip(1.0 - shadow_weight - high_mask, 0.0, 1.0)
+    hdr = img_float * base_weight + over * shadow_weight + under * high_mask
     return np.clip(hdr, 0, 255).astype(np.uint8)
 
 def apply_hsl_wheel(image_np: np.ndarray, masks) -> np.ndarray:
@@ -786,7 +787,7 @@ def apply_recommended_adjustments(
         masks = detect_regions(image_np, is_raw=is_raw)
 
     # 1. Single-Image HDR Fusion (Apply at the start of adjustments to extend dynamic range)
-    if is_final_render:
+    if is_final_render and analysis.scene not in {"outdoor_highlight", "outdoor_balanced"}:
         image_np = apply_hdr_fusion(image_np, masks)
 
     skin_mask_float = masks.skin.astype(np.float32) / 255.0
@@ -816,6 +817,12 @@ def apply_recommended_adjustments(
     wb_strength = (0.22 if is_people_indoor else 0.12) * profile.get("wb_mult", 1.0)
     image_np = _safe_gray_world_white_balance(image_np, wb_strength, neutral_wall_mask=masks.neutral_wall_floor)
 
+    original_hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
+    sat = original_hsv[:, :, 1].astype(np.float32)
+    low_saturation_float = np.clip((48.0 - sat) / 24.0, 0.0, 1.0)
+    low_saturation_float = low_saturation_float * low_saturation_float * (3.0 - 2.0 * low_saturation_float)
+    low_saturation_float = cv2.GaussianBlur(low_saturation_float, (0, 0), 3.0)
+    low_saturation_float = np.clip(low_saturation_float, 0.0, 1.0)
     lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
     lf = np.clip(l.astype(np.float32) / 255.0, 0.0, 1.0)
@@ -889,29 +896,46 @@ def apply_recommended_adjustments(
         blur_orig = cv2.GaussianBlur(lf_orig, (5, 5), 0)
         texture = lf_orig - blur_orig
         bright_mask = np.clip((lf_orig - 0.65) / 0.35, 0.0, 1.0)
-        recovery_mask = bright_mask * (1.0 + 0.6 * sky_bright_outdoor_float + 0.4 * lamp_highlight_float)
+        recovery_mask = bright_mask * (1.0 + 0.4 * lamp_highlight_float)
+        if analysis.scene in {"outdoor_highlight", "outdoor_balanced"}:
+            sky_texture_protect = np.clip(np.maximum(sky_bright_outdoor_float, low_saturation_float), 0.0, 1.0)
+            recovery_mask = recovery_mask * (1.0 - sky_texture_protect)
         recovery_mask = np.clip(recovery_mask, 0.0, 1.0)
-        lf = np.clip(lf + texture * 1.6 * recovery_mask, 0.0, 1.0)
+        lf = np.clip(lf + texture * 1.2 * recovery_mask, 0.0, 1.0)
 
     l_new = np.clip(lf * 255.0, 0, 255).astype(np.uint8)
+    if analysis.scene in {"outdoor_highlight", "outdoor_balanced"}:
+        sky_neutral_protect = np.clip(np.maximum(sky_bright_outdoor_float, low_saturation_float), 0.0, 1.0)
+        min_protected_l = np.maximum(l.astype(np.float32) - 18.0, 0.0)
+        protected_l = np.maximum(l_new.astype(np.float32), min_protected_l)
+        l_new = (l_new.astype(np.float32) * (1.0 - sky_neutral_protect) + protected_l * sky_neutral_protect).astype(np.uint8)
     ratio = np.clip((l_new.astype(np.float32) + 12.0) / (l.astype(np.float32) + 12.0), 0.82, 1.14)
+    if analysis.scene in {"outdoor_highlight", "outdoor_balanced"}:
+        neutral_protect = np.maximum(neutral_wall_floor_float, low_saturation_float)
+    else:
+        neutral_protect = np.maximum(neutral_wall_floor_float, low_saturation_float) * (1.0 - skin_mask_float)
+    ratio = ratio * (1.0 - neutral_protect) + neutral_protect
     if is_people_indoor:
         ratio = 1.0 + (ratio - 1.0) * 0.35
     a_new = np.clip((a.astype(np.float32) - 128.0) * ratio + 128.0, 0, 255).astype(np.uint8)
     b_new = np.clip((b.astype(np.float32) - 128.0) * ratio + 128.0, 0, 255).astype(np.uint8)
     rgb = cv2.cvtColor(cv2.merge((l_new, a_new, b_new)), cv2.COLOR_LAB2RGB)
-    rgb = _protect_lamp_highlights(rgb)
+    if analysis.scene not in {"outdoor_highlight", "outdoor_balanced"}:
+        rgb = _protect_lamp_highlights(rgb)
 
     if sliders['vibrance'] > 0:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
         s_ch = hsv[:, :, 1]
+        source_s = s_ch.copy()
         vib = sliders['vibrance'] * (0.55 if is_people_indoor else 0.85) * profile.get("vibrance_mult", 1.0) * strength["vibrance"]
         boosted = s_ch + (255.0 - s_ch) * vib * (1.0 - s_ch / 255.0)
         
-        sky_boost = sky_bright_outdoor_float * (1.0 - skin_mask_float) * 0.25 * (255.0 - s_ch)
+        sky_color_mask = sky_bright_outdoor_float * (1.0 - neutral_wall_floor_float)
+        sky_boost = sky_color_mask * (1.0 - skin_mask_float) * 0.16 * (255.0 - s_ch)
         sky_boost = sky_boost * (1.0 - lamp_highlight_float)
         boosted = boosted + sky_boost
         
+        boosted = boosted * (1.0 - neutral_protect) + source_s * neutral_protect
         s_ch = boosted * (1.0 - 0.82 * skin_mask_float) + s_ch * (0.82 * skin_mask_float)
         hsv[:, :, 1] = np.clip(s_ch, 0, 255)
         rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
@@ -924,11 +948,14 @@ def apply_recommended_adjustments(
     if sliders['clarity'] > 0:
         blur = cv2.GaussianBlur(rgb, (0, 0), 1.0)
         amount = sliders['clarity'] * (0.22 if is_people_indoor else 0.36) * profile.get("clarity_mult", 1.0) * strength["clarity"]
+        clarity_protect = np.maximum(sky_bright_outdoor_float, neutral_protect)
+        clarity_weight = (1.0 - skin_mask_float) * (1.0 - clarity_protect)
         clarity_img = np.clip(rgb.astype(np.float32) + amount * (rgb.astype(np.float32) - blur.astype(np.float32)), 0, 255)
         
         smooth_skin = cv2.bilateralFilter(rgb, 5, 12, 12)
-        rgb = (clarity_img * (1.0 - skin_mask_float[:, :, None]) + 
-               smooth_skin.astype(np.float32) * skin_mask_float[:, :, None]).astype(np.uint8)
+        rgb = (clarity_img * clarity_weight[:, :, None] +
+               smooth_skin.astype(np.float32) * skin_mask_float[:, :, None] +
+               rgb.astype(np.float32) * (1.0 - clarity_weight[:, :, None] - skin_mask_float[:, :, None])).astype(np.uint8)
 
     if is_people_indoor:
         lab_skin = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -937,12 +964,26 @@ def apply_recommended_adjustments(
         lab_skin[:, :, 0] = lab_skin[:, :, 0] * (1.0 - skin_strength) + l_target * skin_strength
         rgb = cv2.cvtColor(np.clip(lab_skin, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
 
-    lamp_mask_float = masks.lamp_highlight.astype(np.float32) / 255.0
+    lamp_mask_float = lamp_highlight_float
+    if analysis.scene in {"outdoor_highlight", "outdoor_balanced"}:
+        protected_source = image_np.astype(np.float32)
+        protect_weight = np.clip(sky_neutral_protect, 0.0, 1.0)[:, :, None]
+        rgb = (rgb.astype(np.float32) * (1.0 - protect_weight) + protected_source * protect_weight).astype(np.uint8)
+
+        non_sky_weight = np.clip(1.0 - protect_weight, 0.0, 1.0)
+        source_lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+        rgb_lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        min_l = np.minimum(source_lab[:, :, 0] + 2.0, 255.0)
+        rgb_lab[:, :, 0] = rgb_lab[:, :, 0] * protect_weight[:, :, 0] + np.maximum(rgb_lab[:, :, 0], min_l) * non_sky_weight[:, :, 0]
+
+        rgb = cv2.cvtColor(np.clip(rgb_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2RGB)
+
     gray_img = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[:, :, None]
     rgb = (rgb.astype(np.float32) * (1.0 - lamp_mask_float[:, :, None]) + 
            gray_img.astype(np.float32) * lamp_mask_float[:, :, None]).astype(np.uint8)
 
-    rgb = _protect_lamp_highlights(rgb)
+    if analysis.scene not in {"outdoor_highlight", "outdoor_balanced"}:
+        rgb = _protect_lamp_highlights(rgb)
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
@@ -976,6 +1017,9 @@ def _candidate_quality_score(original: np.ndarray, candidate: np.ndarray, is_raw
     candidate_skin_l = _skin_luminance_mean(candidate)
     target_center = 143.0 if original_analysis.has_skin else 132.0
     target_skin = 146.0
+    outdoor_no_face = original_analysis.scene in {"outdoor_highlight", "outdoor_balanced"} and not original_analysis.has_face
+    if outdoor_no_face:
+        target_center = min(190.0, original_center + 2.0)
     if batch_context:
         if batch_context.get("target_center"):
             target_center = 0.65 * target_center + 0.35 * float(batch_context["target_center"])
@@ -995,7 +1039,7 @@ def _candidate_quality_score(original: np.ndarray, candidate: np.ndarray, is_raw
             score -= (original_skin_l - candidate_skin_l) * 1.4
 
     center_lift = candidate_center - original_center
-    if original_analysis.has_skin and center_lift < 6.0:
+    if original_analysis.has_skin and not outdoor_no_face and center_lift < 6.0:
         score -= (6.0 - center_lift) * 2.4
     if center_lift > 24.0:
         score -= (center_lift - 24.0) * 1.7
@@ -1040,7 +1084,7 @@ def _profiles_for_analysis(analysis) -> list[str]:
         return ["event_bright", "people_bright", "event_pop", "skin_safe", "lamp_safe", "natural_safe", "balanced_pop"]
     if analysis.scene == "outdoor_highlight":
         return ["highlight_safe", "skin_safe", "natural_safe", "balanced_pop"]
-    return ["balanced_pop", "event_pop", "skin_safe", "natural_safe", "people_bright"]
+    return ["balanced_pop", "event_pop", "skin_safe", "natural_safe"]
 
 
 def _score_smart_auto_profiles(image_np: np.ndarray, is_raw: bool = False, batch_context: dict | None = None, smart_strength: str = "Event Balanced") -> tuple[str, float, list[tuple[str, float]], np.ndarray]:

@@ -247,6 +247,7 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                 output_path,
                 "JPEG",
                 quality=quality,
+                subsampling=0,
                 optimize=True
             )
         except OSError as e:
@@ -254,7 +255,8 @@ def convert_raw_to_jpg(input_path: str, output_path: str, settings: dict) -> dic
                 img_pil.save(
                     output_path,
                     "JPEG",
-                    quality=quality
+                    quality=quality,
+                    subsampling=0
                 )
             else:
                 raise e

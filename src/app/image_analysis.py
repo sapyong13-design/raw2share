@@ -49,6 +49,7 @@ def classify_scene(
     shadow_ratio: float,
     saturation_mean: float,
     is_raw: bool,
+    outdoor_sky_ratio: float = 0.0,
 ) -> str:
     if highlight_clip_ratio > 0.035 or mean_luminance > 210 or (mean_luminance > 165 and highlight_clip_ratio > 0.015):
         return "outdoor_highlight"
@@ -56,6 +57,8 @@ def classify_scene(
         return "low_light"
     if highlight_clip_ratio > 0.01 and shadow_ratio > 0.25:
         return "backlit_high_contrast"
+    if outdoor_sky_ratio > 0.08:
+        return "outdoor_balanced"
     if mean_luminance > 145 and saturation_mean > 45:
         return "outdoor_balanced"
     return "indoor_balanced"
@@ -128,6 +131,15 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
     contrast = float(np.std(luminance))
     noise_level = _estimate_noise(gray)
     vignette_strength = _estimate_vignette(luminance)
+    h, w = gray.shape
+    upper_h = max(1, int(h * 0.48))
+    upper_hsv = hsv[:upper_h, :, :]
+    upper_l = luminance[:upper_h, :]
+    upper_s = upper_hsv[:, :, 1].astype(np.float32)
+    upper_hue = upper_hsv[:, :, 0].astype(np.float32)
+    bright_cloud = (upper_l >= 170.0) & (upper_s <= 80.0)
+    blue_sky = (upper_hue >= 92.0) & (upper_hue <= 132.0) & (upper_s >= 35.0) & (upper_l >= 105.0)
+    outdoor_sky_ratio = float(np.mean(bright_cloud | blue_sky))
 
     if highlight_clip_ratio > 0.035 or mean_luminance > 175:
         exposure = "overexposed"
@@ -142,6 +154,7 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
         shadow_ratio=shadow_ratio,
         saturation_mean=saturation_mean,
         is_raw=is_raw,
+        outdoor_sky_ratio=outdoor_sky_ratio,
     )
 
     # Skin detection (YCrCb)
@@ -150,10 +163,15 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
     upper_skin = np.array([255, 173, 127], dtype=np.uint8)
     skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
     skin_ratio = float(np.mean(skin_mask > 0))
-    has_skin = bool(skin_ratio > 0.01)
+
+    h, w = gray.shape
+    face_count, face_ratio = _detect_faces(gray)
+    has_face = bool(face_count > 0)
+    false_skin_building = scene in {"outdoor_highlight", "outdoor_balanced"} and outdoor_sky_ratio > 0.08 and not has_face and 0.08 < skin_ratio < 0.60
+    has_skin = bool(skin_ratio > 0.01 and not false_skin_building)
+    effective_skin_mask = skin_mask if has_skin else np.zeros_like(skin_mask)
 
     # Subject detection (Center region)
-    h, w = gray.shape
     cy_min, cy_max = int(h * 0.2), int(h * 0.8)
     cx_min, cx_max = int(w * 0.2), int(w * 0.8)
     center_region = np.zeros_like(gray, dtype=bool)
@@ -161,10 +179,8 @@ def analyze_image(image_np: np.ndarray, is_raw: bool = False) -> ImageAnalysis:
 
     overall_mean = np.mean(gray)
     center_deviation = np.abs(gray.astype(np.float32) - overall_mean) > 25
-    subject_mask = (center_deviation | (skin_mask > 0)) & center_region
+    subject_mask = (center_deviation | (effective_skin_mask > 0)) & center_region
     subject_ratio = float(np.mean(subject_mask))
-    face_count, face_ratio = _detect_faces(gray)
-    has_face = bool(face_count > 0)
     if has_face:
         subject_ratio = max(subject_ratio, min(0.35, face_ratio * 4.0))
     has_subject = bool(subject_ratio > 0.02 or has_face)
